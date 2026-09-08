@@ -1,0 +1,6 @@
+#include <windows.h>
+#include "resource.h"
+
+; NSI 模板作为资源内嵌，保证单文件 exe 在没有外部 template 目录时也能工作
+IDR_TEMPLATE RCDATA "template.nsi"
+IDI_APPICON  ICON   "app.ico"

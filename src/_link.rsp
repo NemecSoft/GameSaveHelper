@@ -1,0 +1,1 @@
+/nologo /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS /MACHINE:X64 /OUT:D:\AI\nsis\GameSaveHelper.exe GameSaveHelper.obj resource.res user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib shlwapi.lib ole32.lib advapi32.lib

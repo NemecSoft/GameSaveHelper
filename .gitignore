@@ -1,0 +1,22 @@
+# ============================================================================
+#  GameSaveHelper - git 忽略清单
+#  只提交源码，编译产物和临时输出全部忽略
+# ============================================================================
+
+# 编译中间产物
+src/GameSaveHelper.obj
+src/RCa*
+src/resource.res
+src/template.nsi
+
+# 编译产物 exe（build.bat 会重新生成）
+GameSaveHelper.exe
+src/GameSaveHelper.exe
+
+# 运行/构建输出目录
+build/
+out/
+logs/
+
+# 测试数据
+_test/

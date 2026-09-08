@@ -1,0 +1,1 @@
+/nologo /utf-8 /O2 /Oi /GL /Gy /MT /EHsc /std:c++17 /W3 /DUNICODE /D_UNICODE /DWIN32 /D_WINDOWS /DNDEBUG /c /Fo:GameSaveHelper.obj GameSaveHelper.cpp
