@@ -115,10 +115,9 @@ Function MainPageCreate
   Pop $hTip
   SetCtlColors $hTip ${CLR_MUTED} ${CLR_WHITE}
 
-  ; 底部主按钮改成「恢复存档」（放大更醒目），「关闭」藏起「上一步」
+  ; 底部主按钮改成「恢复存档」（正常尺寸），「关闭」藏起「上一步」
   GetDlgItem $0 $HWNDPARENT 1
   SendMessage $0 ${WM_SETTEXT} 0 "STR:恢复存档"
-  System::Call "user32::SetWindowPos(p r0, p 0, i 0, i 0, i 150, i 36, i 6)"
   GetDlgItem $0 $HWNDPARENT 2
   SendMessage $0 ${WM_SETTEXT} 0 "STR:关闭"
   GetDlgItem $0 $HWNDPARENT 3

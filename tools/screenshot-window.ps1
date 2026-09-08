@@ -1,4 +1,4 @@
-param([string]$Exe, [string]$OutPng)
+param([string]$Exe, [string]$OutPng, [string]$ArgList = "")
 # 启动指定 exe，等窗口出来后截屏窗口区域保存为 png，然后关掉进程
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -10,7 +10,11 @@ public class W {
   public struct RECT { public int L; public int T; public int R; public int B; }
 }
 "@
-$p = Start-Process -FilePath $Exe -PassThru
+if ($ArgList -ne "") {
+    $p = Start-Process -FilePath $Exe -ArgumentList $ArgList -PassThru
+} else {
+    $p = Start-Process -FilePath $Exe -PassThru
+}
 Start-Sleep -Milliseconds 3000
 $p.Refresh()
 $h = $p.MainWindowHandle

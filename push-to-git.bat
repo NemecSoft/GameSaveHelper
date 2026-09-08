@@ -30,7 +30,7 @@ REM ---------- 3. 提交（有暂存变更才提交，重复运行不会产生�
 echo [3/5] git commit ...
 git diff --cached --quiet
 if errorlevel 1 (
-    git commit -m "first commit"
+    git commit -m "更新 %date% %time%"
     if errorlevel 1 goto :fail
 ) else (
     echo        没有新的变更需要提交

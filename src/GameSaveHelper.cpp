@@ -60,32 +60,29 @@ enum {
     IDC_TEXT = 1001,
     IDC_OPEN,
     IDC_CLOSE,
-    IDC_PROGRESS
+    IDC_PROGRESS,
+    IDC_STATUS
 };
 
 // ---------------------------------------------------------------------------
-// 窗口背景色（模仿老 bat 的 color 1f 蓝底 / 2f 绿底 / 4f 红底）
+// 配色（现代浅色风格）：状态标题蓝/绿/红，正文区浅灰卡片
 // ---------------------------------------------------------------------------
-enum { BG_BLUE = 0, BG_GREEN = 1, BG_RED = 2 };
-
-static COLORREF BgColor(int m)
-{
-    switch (m) {
-    case BG_GREEN: return RGB(0, 140, 0);    // 备份成功（老 bat color 2f）
-    case BG_RED:   return RGB(176, 0, 0);    // 备份失败（老 bat color 4f）
-    default:       return RGB(0, 0, 168);    // 备份进行中（老 bat color 1f）
-    }
-}
+static const COLORREF CLR_RUN  = RGB(0, 103, 192);   // 备份进行中
+static const COLORREF CLR_OK   = RGB(16, 124, 16);   // 备份成功
+static const COLORREF CLR_BAD  = RGB(196, 43, 28);   // 备份失败
+static const COLORREF CLR_CARD = RGB(246, 246, 246); // 正文区底色
+static const COLORREF CLR_INK  = RGB(27, 27, 27);    // 正文文字色
 
 // ---------------------------------------------------------------------------
 // 全局
 // ---------------------------------------------------------------------------
 static int      g_dpi = 96;
 static HFONT    g_fontUI = nullptr;          // 9pt
+static HFONT    g_fontStatus = nullptr;      // 13pt bold（顶部状态标题）
 static HINSTANCE g_inst = nullptr;
 
-static int      g_bgMode = BG_BLUE;          // 当前背景色模式
-static HBRUSH   g_brushBg = nullptr;         // 对应背景刷子（颜色变化时重建）
+static HBRUSH   g_brushCard = nullptr;       // 正文区浅灰底刷子
+static COLORREF g_statusColor = CLR_RUN;     // 当前状态标题颜色
 
 static bool     g_busy = false;
 static std::wstring g_text;                  // 窗口里显示的全部文字
@@ -339,6 +336,7 @@ struct Job {
 
 struct Outcome {
     bool        ok = false;
+    std::wstring header;    // 状态标题（顶部彩色大字，如「备份成功」）
     std::wstring text;      // 一句话结论
     std::wstring detail;    // 多行日志
     std::wstring exePath;
@@ -479,8 +477,8 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
 {
     Outcome oc;
 
-    if (job.gameName.empty()) { oc.text = L"没有游戏名称。"; return oc; }
-    if (job.parts.empty())    { oc.text = L"没有要备份的位置。"; return oc; }
+    if (job.gameName.empty()) { oc.header = L"备份失败"; oc.text = L"没有游戏名称。"; return oc; }
+    if (job.parts.empty())    { oc.header = L"备份失败"; oc.text = L"没有要备份的位置。"; return oc; }
 
     std::wstring log;
     auto logLine = [&log](const std::wstring& s) { log += s; log += L"\r\n"; };
@@ -511,6 +509,7 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     if (!errs.empty()) {
         std::wstring all;
         for (auto& e : errs) { all += e; all += L"\n"; }
+        oc.header = L"备份失败，没有存档或者存档被锁定了";
         oc.text = all;
         oc.detail = log;
         return oc;
@@ -520,7 +519,7 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
         progress(L"共 " + std::to_wstring(totalFiles) + L" 个文件（" + FormatSize(totalSize) +
                  L"），正在生成安装脚本...");
 
-    // 2. 输出文件名：游戏名 + 时间（精确到秒）；默认放系统桌面
+    // 2. 输出文件名：存档备份【游戏名】_时间（精确到秒）；默认放系统桌面
     SYSTEMTIME st{}; GetLocalTime(&st);
     wchar_t stamp[64], human[64];
     swprintf_s(stamp, L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay,
@@ -531,11 +530,13 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     std::wstring outDir = job.outDir.empty() ? GetDesktopDir() : job.outDir;
     DWORD mkAttr = GetFileAttributesW(outDir.c_str());
     if (mkAttr == INVALID_FILE_ATTRIBUTES) CreateDirectoryW(outDir.c_str(), nullptr);
-    std::wstring exePath = JoinPath(outDir, SanitizeFileName(job.gameName) + L"_" + stamp + L".exe");
+    std::wstring exePath = JoinPath(outDir,
+                             L"存档备份【" + SanitizeFileName(job.gameName) + L"】_" + stamp + L".exe");
 
     // 3. 找 makensis
     std::wstring makensis;
     if (!FindMakeNsis(makensis)) {
+        oc.header = L"备份失败";
         oc.text = L"没找到 makensis.exe。请把 NSIS 放到本程序目录下的 nsis\\ 文件夹里。";
         oc.detail = log;
         return oc;
@@ -545,6 +546,7 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     // 4. 生成 NSI
     std::string tmpl; std::wstring tmplUsed;
     if (!LoadTemplate(tmpl, tmplUsed)) {
+        oc.header = L"备份失败";
         oc.text = L"模板加载失败。";
         oc.detail = log;
         return oc;
@@ -623,7 +625,7 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
         std::string bom = "\xEF\xBB\xBF";
         HANDLE h = CreateFileW(nsiPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) { oc.text = L"无法写入脚本文件。"; return oc; }
+        if (h == INVALID_HANDLE_VALUE) { oc.header = L"备份失败"; oc.text = L"无法写入脚本文件。"; return oc; }
         DWORD w = 0;
         WriteFile(h, bom.data(), 3, &w, nullptr);
         WriteFile(h, tmpl.data(), (DWORD)tmpl.size(), &w, nullptr);
@@ -675,12 +677,13 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     if (!started || code != 0 || !FileExistsW(exePath.c_str())) {
         logLine(L"编译失败（退出码 " + std::to_wstring(code) + L"），脚本保留在：");
         logLine(L"  " + nsiPath);
+        oc.header = L"备份失败";
         oc.text = L"编译失败。";
         oc.detail = log + L"\r\n" + U82W(compilerOut);
         return oc;
     }
 
-    // 6. 成功
+    // 6. 成功：显示备份文件信息 + 恢复路径 + 使用方法
     ULONGLONG exeSize = 0;
     {
         WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -689,12 +692,21 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     }
 
     logLine(L"");
-    logLine(L"备份包：" + exePath);
-    logLine(L"体积：" + FormatSize(exeSize));
+    logLine(L"备份文件：" + exePath);
+    logLine(L"文件大小：" + FormatSize(exeSize) + L" · 备份时间：" + human);
+    logLine(L"");
+    logLine(L"恢复路径（双击备份包可一键恢复到以下位置）：");
+    for (const auto& p : parts)
+        logLine(L"  · " + p.dir);
+    logLine(L"");
+    logLine(L"使用方法：");
+    logLine(L"  1. 把备份文件保存到网盘、U盘或微信/QQ，即可带走存档");
+    logLine(L"  2. 把备份拷回电脑，双击后点「恢复存档」即可一键还原");
+    logLine(L"  3. 微信传输会在文件末尾追加 .tmp，删除这 4 个字符即可使用");
 
     oc.ok = true;
     oc.exePath = exePath;
-    oc.text = L"备份成功！";
+    oc.header = L"备份成功";
     oc.detail = log;
     return oc;
 }
@@ -703,7 +715,8 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
 // 主窗口
 // ---------------------------------------------------------------------------
 static HWND g_hwnd = nullptr;
-static HWND g_textBox = nullptr, g_btnOpen = nullptr, g_btnClose = nullptr, g_prog = nullptr;
+static HWND g_lblStatus = nullptr, g_textBox = nullptr;
+static HWND g_btnOpen = nullptr, g_btnClose = nullptr, g_prog = nullptr;
 static std::wstring g_lastLog;
 
 // 日志文件：<exe目录>\logs\GameSaveHelper.log —— 详细信息都写这里
@@ -747,19 +760,16 @@ static void AppendLine(const std::wstring& s)
 
 static std::wstring SepLine() { return std::wstring(75, L'='); }
 
-// 切换窗口配色（蓝/绿/红底），重建背景刷子并整窗重画
-static void SetBgMode(int m)
+// 设置顶部状态标题（文字 + 颜色）
+static void SetStatusHeader(const std::wstring& s, COLORREF color)
 {
-    if (g_brushBg) DeleteObject(g_brushBg);
-    g_bgMode = m;
-    g_brushBg = CreateSolidBrush(BgColor(m));
-    InvalidateRect(g_hwnd, nullptr, TRUE);
-    UpdateWindow(g_hwnd);
+    g_statusColor = color;
+    SetWindowTextW(g_lblStatus, s.c_str());
+    InvalidateRect(g_lblStatus, nullptr, TRUE);
 }
 
-// 成功/失败后统一的收尾：换底色、显示结果文字、启用按钮
-static void FinishUI(bool ok, const std::wstring& exePath,
-                     const std::wstring& outDirForShow,
+// 成功/失败后统一的收尾：换状态标题、显示结果文字、启用按钮
+static void FinishUI(bool ok, const std::wstring& header,
                      const std::wstring& resultText, const std::wstring& detail)
 {
     SendMessageW(g_prog, PBM_SETMARQUEE, FALSE, 0);
@@ -769,24 +779,15 @@ static void FinishUI(bool ok, const std::wstring& exePath,
     EnableWindow(g_btnOpen, ok ? TRUE : FALSE);
     SetWindowTextW(g_btnOpen, ok ? g_openLabel.c_str() : L"查看日志");
 
-    SetBgMode(ok ? BG_GREEN : BG_RED);
-    AppendLine(L"");
-    AppendLine(SepLine());
+    SetStatusHeader(header, ok ? CLR_OK : CLR_BAD);
+
     if (ok) {
-        // 老 bat 风格的成功输出
-        std::wstring fileName = exePath.substr(exePath.find_last_of(L"\\") + 1);
-        AppendLine(L"备份成功！");
-        AppendLine(SepLine());
-        AppendLine(L"已在" + outDirForShow + L"生成自解压存档【" + fileName + L"】");
-        AppendLine(L"完整路径：" + exePath);
-        AppendLine(SepLine());
-        AppendLine(L"1.保留存档——把以上文件备份到你的网盘、U盘、移动硬盘或微信QQ文件传输助手中即可。");
-        AppendLine(L"2.使用方法——把备份下载到本电脑，双击一键运行即可恢复存档！");
-        AppendLine(L"3.注意：如果传到微信，微信出于安全会在文件末尾添加.tmp，删除这4个字符，即可双击解压一键恢复");
+        // 成功：把备份文件信息、恢复路径、使用方法追加到详情区
+        AppendLine(L"");
+        AppendLine(detail);
     } else {
-        // 老 bat 风格的失败输出
-        AppendLine(L"备份失败，没有存档或者存档被锁定了");
-        AppendLine(SepLine());
+        // 失败原因逐行显示（text 里可能有多行）
+        AppendLine(L"");
         size_t pos = 0;
         std::wstring t = resultText;
         while (pos < t.size()) {
@@ -799,10 +800,9 @@ static void FinishUI(bool ok, const std::wstring& exePath,
         }
         AppendLine(L"详情日志：" + LogFilePath());
     }
-    AppendLine(SepLine());
 
     AppendLog(ok ? L"生成成功" : L"备份失败",
-              resultText + (detail.empty() ? L"" : (L"\r\n" + detail)));
+              header + L"\r\n" + resultText + (detail.empty() ? L"" : (L"\r\n" + detail)));
 }
 
 // 开始备份：锁按钮、显示进度条、后台线程跑
@@ -828,55 +828,66 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE: {
-        HWND h;
-        // 文字区：只读多行编辑框，无边框，背景色随窗口底色
+        // 顶部状态标题（进行中蓝 / 成功绿 / 失败红）
+        g_lblStatus = CreateWindowW(L"STATIC", L"",
+                                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                S(24), S(20), S(592), S(32), hwnd,
+                                (HMENU)(INT_PTR)IDC_STATUS, g_inst, nullptr);
+        SendMessageW(g_lblStatus, WM_SETFONT, (WPARAM)g_fontStatus, TRUE);
+
+        // 正文区：只读多行编辑框，浅灰卡片、无边框
         g_textBox = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                                 ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                                S(16), S(16), S(608), S(280), hwnd,
+                                S(24), S(62), S(592), S(268), hwnd,
                                 (HMENU)(INT_PTR)IDC_TEXT, g_inst, nullptr);
         SendMessageW(g_textBox, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
         // 进度条：备份进行中才显示
         g_prog = CreateWindowW(PROGRESS_CLASSW, L"",
                                WS_CHILD | PBS_MARQUEE | PBS_SMOOTH,
-                               S(16), S(304), S(608), S(8), hwnd,
+                               S(24), S(338), S(592), S(6), hwnd,
                                (HMENU)(INT_PTR)IDC_PROGRESS, g_inst, nullptr);
         ShowWindow(g_prog, SW_HIDE);
 
         // 按钮：「显示备份后的文件」+「关闭」
         g_btnOpen = CreateWindowW(L"BUTTON", g_openLabel.c_str(),
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
-                                  S(454), S(320), S(170), S(32), hwnd,
+                                  S(450), S(354), S(166), S(32), hwnd,
                                   (HMENU)(INT_PTR)IDC_OPEN, g_inst, nullptr);
         SendMessageW(g_btnOpen, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
         g_btnClose = CreateWindowW(L"BUTTON", L"关闭",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                   S(360), S(320), S(86), S(32), hwnd,
+                                   S(352), S(354), S(90), S(32), hwnd,
                                    (HMENU)(INT_PTR)IDC_CLOSE, g_inst, nullptr);
         SendMessageW(g_btnClose, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        (void)h;
         return 0;
     }
 
     case WM_ERASEBKGND: {
         RECT rc; GetClientRect(hwnd, &rc);
-        FillRect((HDC)wp, &rc, g_brushBg);
+        FillRect((HDC)wp, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
         return 1;
     }
 
-    // 只读编辑框走 CTLCOLORSTATIC：文字白色、底色跟窗口一致
+    // 颜色处理：正文编辑框浅灰底深字；状态标题用当前状态色；其余白底
     case WM_CTLCOLORSTATIC:
         if ((HWND)lp == g_textBox) {
             HDC hdc = (HDC)wp;
-            SetBkColor(hdc, BgColor(g_bgMode));
-            SetTextColor(hdc, RGB(255, 255, 255));
-            return (LRESULT)g_brushBg;
+            SetBkColor(hdc, CLR_CARD);
+            SetTextColor(hdc, CLR_INK);
+            return (LRESULT)g_brushCard;
+        }
+        if ((HWND)lp == g_lblStatus) {
+            HDC hdc = (HDC)wp;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, g_statusColor);
+            return (LRESULT)GetStockObject(WHITE_BRUSH);
         }
         SetBkMode((HDC)wp, TRANSPARENT);
-        SetTextColor((HDC)wp, RGB(255, 255, 255));
-        return (LRESULT)g_brushBg;
+        SetTextColor((HDC)wp, CLR_INK);
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -908,14 +919,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             Outcome* oc = (Outcome*)lp;
             g_lastExe = oc->exePath;
             g_lastLog = oc->detail;
-            // 输出目录的展示名：是桌面就叫「桌面」，否则用完整目录
-            std::wstring place = L"桌面";
-            if (!oc->exePath.empty()) {
-                std::wstring dir = oc->exePath.substr(0, oc->exePath.find_last_of(L"\\"));
-                if (_wcsicmp(dir.c_str(), GetDesktopDir().c_str()) != 0)
-                    place = L"目录：" + dir;
-            }
-            FinishUI(oc->ok, oc->exePath, place, oc->text, oc->detail);
+            FinishUI(oc->ok,
+                     oc->header.empty() ? (oc->ok ? L"备份成功" : L"备份失败") : oc->header,
+                     oc->text, oc->detail);
             delete oc;
         }
         return 0;
@@ -960,7 +966,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     g_fontUI = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
-    g_brushBg = CreateSolidBrush(BgColor(g_bgMode));
+    g_fontStatus = CreateFontW(-MulDiv(13, g_dpi, 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    g_brushCard = CreateSolidBrush(CLR_CARD);
 
     // ======================= 命令行解析（严格模式，不做推断） =======================
     // 规则（需求明确）：
@@ -1075,14 +1084,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     // ---------------- 组装要显示的初始内容 ----------------
     Job g_job{};
     bool hasJob = false;
+    std::wstring initHeader;
+    COLORREF initColor = CLR_RUN;
 
     if (!argError.empty()) {
-        // 参数错误：红底 + 老 bat 的报错文字 + 用法说明
-        g_bgMode = BG_RED;
-        DeleteObject(g_brushBg);
-        g_brushBg = CreateSolidBrush(BgColor(g_bgMode));
-        g_text = L"备份失败，参数错误，请联系管理员...\r\n\r\n";
-        g_text += argError + L"\r\n\r\n";
+        // 参数错误：红色状态标题 + 用法说明
+        initHeader = L"备份失败，参数错误，请联系管理员...";
+        initColor = CLR_BAD;
+        g_text = argError + L"\r\n\r\n";
         g_text += L"用法：\r\n";
         g_text += L"  GameSaveHelper.exe 游戏名\r\n";
         g_text += L"      到 config.json 里读取该游戏的存档路径配置\r\n";
@@ -1105,10 +1114,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             g_job.parts.push_back(p);
         }
         hasJob = true;
-        g_bgMode = BG_BLUE;
-        DeleteObject(g_brushBg);
-        g_brushBg = CreateSolidBrush(BgColor(g_bgMode));
-        g_text = L"正在生成备份......\r\n";
+        initHeader = L"正在生成备份......";
+        initColor = CLR_RUN;
     }
 
     // 「显示备份后的文件」按钮文字（显示文件名，更直观）
@@ -1126,18 +1133,29 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
     RegisterClassExW(&wc);
 
-    // 按客户区 640 x 360 精确算窗口大小
-    RECT rc{ 0, 0, S(640), S(360) };
+    // 按客户区 640 x 400 精确算窗口大小
+    RECT rc{ 0, 0, S(640), S(400) };
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     int wndW = rc.right - rc.left, wndH = rc.bottom - rc.top;
 
+    // 窗口屏幕居中（按工作区，避开任务栏）
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int posX = (wa.right - wa.left - wndW) / 2 + wa.left;
+    int posY = (wa.bottom - wa.top - wndH) / 3 + wa.top;
+    if (posX < wa.left) posX = wa.left;
+    if (posY < wa.top)  posY = wa.top;
+
     g_hwnd = CreateWindowExW(0, L"GameSaveHelperWnd", caption.c_str(),
                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                             CW_USEDEFAULT, CW_USEDEFAULT, wndW, wndH,
+                             posX, posY, wndW, wndH,
                              nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
+
+    // 设置初始状态标题
+    SetStatusHeader(initHeader.empty() ? L"" : initHeader, initColor);
 
     // 初始文字一次性灌进编辑框
     SetWindowTextW(g_textBox, g_text.c_str());
