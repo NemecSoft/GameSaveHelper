@@ -131,33 +131,28 @@ Function MainPageCreate
   ; ============ 游戏封面图（加载嵌入的 BMP；未找到则此段为空） ============
 @@COVER_LOAD@@
 
-  ; ============ 顶部橘红大横幅（先创建） ============
-  ${NSD_CreateLabel} 0 @@COVER_TOP@@u 100% 86u ""
-  Pop $hHead
-  SetCtlColors $hHead ${CLR_ACCENT} ${CLR_ACCENT}
-
-  ; 横幅大标题（白字加粗；宽 62% 给右侧封面缩略图让位）
+  ; 大标题（默认底色，深色字）
   ${NSD_CreateLabel} 16u @@TITLE_Y@@u 55% 18u "${PRODUCT_NAME} 恢复存档"
   Pop $hTitle
-  SetCtlColors $hTitle ${CLR_TITLE} ${CLR_ACCENT}
+  SetCtlColors $hTitle ${CLR_TEXT} transparent
   CreateFont $1 "Microsoft YaHei UI" 16 700
   SendMessage $hTitle ${WM_SETFONT} $1 1
 
   ; 横幅副标题（浅暖小字，两行：备份时间 / 数量与体积）
   ${NSD_CreateLabel} 16u @@SUB_Y@@u 55% 12u "备份于 ${BACKUP_TIME}"
   Pop $hSub
-  SetCtlColors $hSub ${CLR_SUB} ${CLR_ACCENT}
+  SetCtlColors $hSub ${CLR_MUTED} transparent
   CreateFont $1 "Microsoft YaHei UI" 10 400
   SendMessage $hSub ${WM_SETFONT} $1 1
   ${NSD_CreateLabel} 16u @@SUB2_Y@@u 55% 12u \
     "共 ${PART_COUNT} 个位置 / ${TOTAL_FILES} 个文件（${TOTAL_SIZE}）"
   Pop $hSub2
-  SetCtlColors $hSub2 ${CLR_SUB} ${CLR_ACCENT}
+  SetCtlColors $hSub2 ${CLR_MUTED} transparent
   CreateFont $1 "Microsoft YaHei UI" 10 400
   SendMessage $hSub2 ${WM_SETFONT} $1 1
 
   ; 正文小节标题
-  ${NSD_CreateLabel} 16u @@SEC_Y@@u 90% 12u "恢复到以下位置（可以直接修改）："
+  ${NSD_CreateLabel} 16u @@SEC_Y@@u 90% 12u "将恢复存档到以下位置（保留默认，不要修改）："
   Pop $hSec
   SetCtlColors $hSec ${CLR_TEXT} transparent
   CreateFont $1 "Microsoft YaHei UI" 11 600
@@ -166,30 +161,24 @@ Function MainPageCreate
 @@PART_CREATE@@
 
   ${NSD_CreateLabel} 14u @@TIP_Y@@u 90% 18u \
-    "点「恢复存档」开始。若目标位置已有文件，会先问你要不要覆盖。"
+    "点击[恢复存档]按钮，开始恢复本存档。若目标位置已有文件，会询问是否覆盖。"
   Pop $hTip
   SetCtlColors $hTip ${CLR_MUTED} transparent
 
-  ; 页内按钮：恢复存档居中 + 取消在右（创建后提顶，确保显示在收边条之上）
-  ${NSD_CreateButton} 42% @@BTN_Y@@u 16% 24u "恢复存档"
-  Pop $hBtnGo
-  ${NSD_OnClick} $hBtnGo OnGoClick
-  System::Call "user32::BringWindowToTop(p $hBtnGo)"
+  ; 取消按钮在右
   ${NSD_CreateButton} 86% @@BTN_Y@@u 13% 24u "取消"
   Pop $hBtnClose
   ${NSD_OnClick} $hBtnClose OnCloseClick
   System::Call "user32::BringWindowToTop(p $hBtnClose)"
 
-  ; 底部橘色收边条（最后创建；带 WS_CLIPSIBLINGS 防止盖住按钮）
-  ${NSD_CreateLabel} 0 @@BAND_Y@@u 100% 200u ""
-  Pop $hBand
-  SetCtlColors $hBand ${CLR_ACCENT} ${CLR_ACCENT}
-  System::Call "user32::GetWindowLongW(p $hBand, i -16)i.r5"
-  IntOp $5 $5 | 0x04000000
-  System::Call "user32::SetWindowLongW(p $hBand, i -16, i $5)"
-
-  ; 游戏封面缩略图（放横幅右侧；需要横幅已创建，故放最后；用像素精确定位）
+  ; 游戏封面缩略图（右上角；高 86u，像素精确定位到最右缘）
 @@COVER_CREATE@@
+
+  ; 主按钮：恢复存档（默认样式，居中）
+  ${NSD_CreateButton} 42% @@BTN_Y@@u 16% 24u "恢复存档"
+  Pop $hBtnGo
+  ${NSD_OnClick} $hBtnGo OnGoClick
+  System::Call "user32::BringWindowToTop(p $hBtnGo)"
 
   nsDialogs::Show
 FunctionEnd

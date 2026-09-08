@@ -847,7 +847,7 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
                     "  ${NSD_CreateBitmap} 0 0 100% 86u \"\"\r\n"
                     "  Pop $hCover\r\n"
                     "  System::Call \"*(i 0, i 0, i 0, i 0)p.R3\"\r\n"
-                    "  System::Call \"user32::GetWindowRect(p $hHead, p $R3)\"\r\n"
+                    "  System::Call \"user32::GetWindowRect(p $hCover, p $R3)\"\r\n"
                     "  System::Call \"*$R3(i, i.R4, i, i.R5)\"\r\n"   // R4=top R5=bottom
                     "  IntOp $R5 $R5 - $R4\r\n"             // R5 = 横幅高度(px) 实测
                     "  System::Call \"user32::GetClientRect(p $0, p $R3)\"\r\n"
