@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 public class W {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   public struct RECT { public int L; public int T; public int R; public int B; }
 }
@@ -20,13 +21,15 @@ Start-Sleep -Milliseconds 3500
 $p.Refresh()
 $h = $p.MainWindowHandle
 if ($h -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id -Force; Write-Output "no window"; exit 1 }
-# 反复置顶，确保窗口在最前
+# 反复置顶，确保窗口在最前；若目标未能成为前台（屏幕被占用）则放弃截屏
 for ($i = 0; $i -lt 3; $i++) {
     [W]::BringWindowToTop($h) | Out-Null
     [W]::SetForegroundWindow($h) | Out-Null
     Start-Sleep -Milliseconds 300
 }
 Start-Sleep -Milliseconds 500
+$fg = [W]::GetForegroundWindow()
+if ($fg -ne $h) { Stop-Process -Id $p.Id -Force; Write-Output 'ABORT: target not foreground, capture skipped'; exit 2 }
 $r = New-Object W+RECT
 [W]::GetWindowRect($h, [ref]$r) | Out-Null
 $wd = $r.R - $r.L; $ht = $r.B - $r.T

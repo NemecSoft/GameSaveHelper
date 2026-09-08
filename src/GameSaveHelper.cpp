@@ -417,6 +417,7 @@ struct AppSettings {
     std::wstring gamesJson;
     std::wstring nsis;
     std::wstring outDir;
+    std::wstring coverDir;   // 游戏封面图目录（与游戏名同名 jpg/png）
     bool recurse = true;
 };
 static AppSettings g_settings;
@@ -458,6 +459,7 @@ static void LoadAppSettings()
     g_settings.gamesJson = ReadSettingString(raw, "gamesJson");
     g_settings.nsis      = ReadSettingString(raw, "nsis");
     g_settings.outDir    = ReadSettingString(raw, "outDir");
+    g_settings.coverDir  = ReadSettingString(raw, "coverDir");
     std::wstring rec     = ReadSettingString(raw, "recurse");
     if (!rec.empty()) g_settings.recurse = (rec == L"true" || rec == L"1");
 }
@@ -530,6 +532,7 @@ struct Job {
     std::wstring        gameName;
     std::vector<Part>   parts;
     std::wstring        outDir;
+    std::wstring        coverDir;   // 封面图目录（空 = settings/默认）
     bool                recurse = true;
 };
 
@@ -769,13 +772,115 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
         return oc;
     }
 
+    // 4.5 游戏封面图：封面目录里找「与游戏名同名」的 .jpg（优先）/.png，
+    //     找到则转成 BMP 嵌进备份包，显示在窗口顶部（原始比例）；找不到就没有背景
+    int  coverHu = 0;
+    std::string coverLoad   = "; (未找到游戏封面图)";
+    std::string coverCreate = "; (未找到游戏封面图)";
+    std::wstring coverSrc;
+    {
+        std::wstring coverDir = !job.coverDir.empty() ? job.coverDir
+                    : (!g_settings.coverDir.empty() ? g_settings.coverDir
+                                                    : L"D:\\YunGame\\PlayNite\\CoverImages");
+        std::wstring game = SanitizeFileName(job.gameName);
+        for (int k = 0; k < 3 && coverSrc.empty(); k++) {
+            std::wstring c = JoinPath(coverDir, game +
+                (k == 0 ? L".jpg" : (k == 1 ? L".png" : L".jpeg")));
+            if (FileExistsW(c)) coverSrc = c;
+        }
+    }
+    if (!coverSrc.empty()) {
+        logLine(L"游戏封面：" + coverSrc);
+        std::wstring coverBuildDir = JoinPath(GetExeDir(), L"build");
+        CreateDirectoryW(coverBuildDir.c_str(), nullptr);
+        std::wstring ps1 = JoinPath(coverBuildDir, L"cover2bmp.ps1");
+        static const char* PS_SRC =
+            "param([string]$Src,[string]$Dst,[int]$MaxH,[int]$MaxW)\r\n"
+            "Add-Type -AssemblyName System.Drawing\r\n"
+            "$i=[System.Drawing.Image]::FromFile($Src)\r\n"
+            "$r=$MaxH/$i.Height\r\n"
+            "if($i.Width*$r -gt $MaxW){$r=$MaxW/$i.Width}\r\n"
+            "$w=[int][Math]::Round($i.Width*$r)\r\n"
+            "$h=[int][Math]::Round($i.Height*$r)\r\n"
+            "$b=New-Object System.Drawing.Bitmap $w,$h\r\n"
+            "$g=[System.Drawing.Graphics]::FromImage($b)\r\n"
+            "$g.DrawImage($i,0,0,$w,$h)\r\n"
+            "$b.Save($Dst,[System.Drawing.Imaging.ImageFormat]::Bmp)\r\n"
+            "$g.Dispose();$b.Dispose();$i.Dispose()\r\n";
+        { HANDLE h = CreateFileW(ps1.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+          if (h != INVALID_HANDLE_VALUE) {
+              DWORD wr = 0;
+              WriteFile(h, PS_SRC, (DWORD)strlen(PS_SRC), &wr, nullptr);
+              CloseHandle(h);
+          } }
+        std::wstring bmp = JoinPath(coverBuildDir, L"cover.bmp");
+        DeleteFileW(bmp.c_str());
+        std::wstring cmd = L"powershell -NoProfile -ExecutionPolicy Bypass -File \"" + ps1
+                         + L"\" -Src \"" + coverSrc + L"\" -Dst \"" + bmp + L"\" -MaxH 262 -MaxW 600";
+        STARTUPINFOW csi{}; csi.cb = sizeof(csi);
+        csi.dwFlags = STARTF_USESHOWWINDOW; csi.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION cpi{};
+        if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW, nullptr, coverBuildDir.c_str(), &csi, &cpi)) {
+            WaitForSingleObject(cpi.hProcess, 15000);
+            CloseHandle(cpi.hThread); CloseHandle(cpi.hProcess);
+        }
+        HANDLE hb = CreateFileW(bmp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hb == INVALID_HANDLE_VALUE) {
+            logLine(L"警告：封面转换失败，备份包不带背景图。");
+        } else {
+            BYTE hd[26] = {}; DWORD rd = 0;
+            ReadFile(hb, hd, 26, &rd, nullptr);
+            CloseHandle(hb);
+            int w = *(int*)(hd + 18), h = *(int*)(hd + 22);
+            if (h < 0) h = -h;
+            if (w > 0 && h > 0) {
+                // 不在 cpp 里换算对话框单位（不同系统字体度量有偏差）。
+                // 把 BMP 的宽高交给模板，NSIS 运行时用 GetDialogBaseUnits 和
+                // 页面客户区实际计算：贴最右缘、高度恒等于横幅 86u（拉伸贴合）。
+                coverLoad = "File \"/oname=$PLUGINSDIR\\cover.bmp\" \"" + W2U8(NsisEsc(bmp)) + "\"";
+                coverCreate =
+                    // 全程用像素计算：横幅高度用 GetWindowRect 实测，位置尺寸用
+                    // SetWindowPos 直接设像素，绕开对话框单位换算的字体差异
+                    "  ${NSD_CreateBitmap} 0 0 100% 86u \"\"\r\n"
+                    "  Pop $hCover\r\n"
+                    "  System::Call \"*(i 0, i 0, i 0, i 0)p.R3\"\r\n"
+                    "  System::Call \"user32::GetWindowRect(p $hHead, p $R3)\"\r\n"
+                    "  System::Call \"*$R3(i, i.R4, i, i.R5)\"\r\n"   // R4=top R5=bottom
+                    "  IntOp $R5 $R5 - $R4\r\n"             // R5 = 横幅高度(px) 实测
+                    "  System::Call \"user32::GetClientRect(p $0, p $R3)\"\r\n"
+                    "  System::Call \"*$R3(i, i, i.R6, i)\"\r\n"      // R6 = 页面宽(px)
+                    "  System::Call \"kernel32::LocalFree(p $R3)\"\r\n"
+                    "  IntOp $R7 $R5 * " + std::to_string(w) + "\r\n"
+                    "  IntOp $R7 $R7 / " + std::to_string(h) + "\r\n" // 封面宽(px)，等比
+                    "  IntOp $R9 $R6 - $R7\r\n"             // x(px)：贴最右缘
+                    "  ${If} $R9 < 0\r\n"
+                    "    StrCpy $R9 0\r\n"
+                    "  ${EndIf}\r\n"
+                    "  System::Call \"user32::SetWindowPos(p $hCover, p 0, i $R9, i 0, i $R7, i $R5, i 4)\"\r\n"
+                    "  ${NSD_SetStretchedImage} $hCover \"$PLUGINSDIR\\cover.bmp\" $R0\r\n"
+                    "  System::Call 'user32::BringWindowToTop(p $hCover)'\r\n"
+                    "  System::Call 'gdi32::DeleteObject(p $R0)'";
+            } else {
+                logLine(L"警告：封面 BMP 无效，备份包不带背景图。");
+            }
+        }
+    } else {
+        logLine(L"未找到游戏封面图（同名 jpg/png），备份包不带背景。");
+    }
+    // 封面图放在按钮下方（窗口底部），内容布局不再因封面下移
+    int coverTop = 0;
+    int rowY0 = 112;
+
     std::string sVars, sInit, sCreate, sLeave, sOver, sRestore, sRaise;
     int n = (int)parts.size();
     for (int i = 0; i < n; i++) {
         const Part& p = parts[i];
         char idx[16]; sprintf_s(idx, "%d", i);
         std::string I(idx);
-        int y = 112 + i * 16;
+        int y = rowY0 + i * 16;
         char ys[16]; sprintf_s(ys, "%d", y);
 
         sVars    += "Var P" + I + "\r\nVar E" + I + "\r\nVar B" + I + "\r\n";
@@ -811,9 +916,13 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
         sRaise   += "  System::Call \"user32::BringWindowToTop(p $B" + I + ")\"\r\n";
     }
 
-    int tipY = 112 + n * 16 + 6;
-    char bandY[16]; sprintf_s(bandY, "%d", tipY + 24);
-    char btnY[16];  sprintf_s(btnY,  "%d", tipY + 30);
+    int tipY = rowY0 + n * 16 + 6;
+    int btnY = tipY + 30;
+    // 封面缩略图已放入横幅右侧，不再影响下方布局与窗口高度
+    char btnYs[16];  sprintf_s(btnYs,  "%d", btnY);
+    char bandYs[16]; sprintf_s(bandYs, "%d", tipY + 24);
+    char bandHs[16]; sprintf_s(bandHs, "%d", 200);
+    char wndH[16];   sprintf_s(wndH,   "%d", (int)((btnY + 45) * 1.53) + 31);
     char tipS[16]; sprintf_s(tipS, "%d", tipY);
 
     // 图标：优先 assets\icon.ico，其次 NSIS 自带（用 NSIS 原生 Icon 命令，
@@ -833,6 +942,22 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     ReplaceAll(tmpl, "@@PART_COUNT@@",    W2U8(std::to_wstring(n)));
     ReplaceAll(tmpl, "@@OUT_FILE@@",      W2U8(NsisEsc(exePath)));
     ReplaceAll(tmpl, "@@ICON_LINE@@",     iconLine);
+    {
+        char tops[16], tys[16], subys[16], secs[16];
+        sprintf_s(tops,  "%d", coverTop);
+        sprintf_s(tys,   "%d", coverTop + 22);
+        sprintf_s(subys, "%d", coverTop + 46);
+        char sub2ys[16]; sprintf_s(sub2ys, "%d", coverTop + 62);
+        ReplaceAll(tmpl, "@@SUB2_Y@@", sub2ys);
+        sprintf_s(secs,  "%d", coverTop + 96);
+        ReplaceAll(tmpl, "@@COVER_LOAD@@",    coverLoad);
+        ReplaceAll(tmpl, "@@COVER_CREATE@@",  coverCreate);
+        ReplaceAll(tmpl, "@@COVER_TOP@@",     tops);
+        ReplaceAll(tmpl, "@@BAND_H@@",        bandHs);
+        ReplaceAll(tmpl, "@@TITLE_Y@@",       tys);
+        ReplaceAll(tmpl, "@@SUB_Y@@",         subys);
+        ReplaceAll(tmpl, "@@SEC_Y@@",         secs);
+    }
     ReplaceAll(tmpl, "@@PART_VARS@@",     sVars);
     ReplaceAll(tmpl, "@@PART_INIT@@",     sInit);
     ReplaceAll(tmpl, "@@PART_CREATE@@",   sCreate);
@@ -841,8 +966,9 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     ReplaceAll(tmpl, "@@PART_OVERWRITE@@",sOver);
     ReplaceAll(tmpl, "@@PART_RESTORE@@",  sRestore);
     ReplaceAll(tmpl, "@@TIP_Y@@",         tipS);
-    ReplaceAll(tmpl, "@@BAND_Y@@",        bandY);
-    ReplaceAll(tmpl, "@@BTN_Y@@",         btnY);
+    ReplaceAll(tmpl, "@@BTN_Y@@",         btnYs);
+    ReplaceAll(tmpl, "@@BAND_Y@@",        bandYs);
+    ReplaceAll(tmpl, "@@WND_H@@",         wndH);
 
     std::wstring buildDir = JoinPath(GetExeDir(), L"build");
     CreateDirectoryW(buildDir.c_str(), nullptr);
@@ -1222,6 +1348,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     bool quiet = false;
     bool noRecurse = false;
     std::wstring cliOut;
+    std::wstring cliCover;
     std::wstring cliConfig;
     std::wstring argError;
     std::wstring configFileUsed;
@@ -1268,6 +1395,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     if (opt == L"q" || opt == L"quiet")           { quiet = true; continue; }
                     if (opt == L"nr" || opt == L"norecurse")      { noRecurse = true; continue; }
                     if (opt.compare(0, 4, L"out:") == 0)          { cliOut = a.substr(5); continue; }
+                    if (opt.compare(0, 6, L"cover:") == 0)        { cliCover = a.substr(7); continue; }
                     if (opt.compare(0, 7, L"config:") == 0)       { cliConfig = a.substr(8); continue; }
                     argError = L"未知选项：" + a;
                     break;
@@ -1312,6 +1440,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         job.gameName = cliName;
         job.recurse = g_settings.recurse && !noRecurse;
         job.outDir = cliOut;      // 空 = 默认放系统桌面
+        job.coverDir = cliCover;
         for (auto& s : cliPaths) {
             Part p;
             SplitPathSpec(s, p.dir, p.pattern);
@@ -1352,6 +1481,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         g_text += L"选项：\r\n";
         g_text += L"  /config:文件路径   指定配置文件（games.json 或 config.json 格式）\r\n";
         g_text += L"  /out:目录          指定备份输出目录（默认桌面）\r\n";
+        g_text += L"  /cover:目录        指定游戏封面图目录（默认 D:\\YunGame\\PlayNite\\CoverImages）\r\n";
         g_text += L"  /q                 静默模式（脚本调用，不出窗口）\r\n";
         g_text += L"示例：\r\n";
         g_text += L"  GameSaveHelper.exe 大富翁11 \"D:\\games\\Z\\Richman 11\\2074800\\*.*\"\r\n";
@@ -1361,6 +1491,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         g_job.gameName = cliName;
         g_job.recurse = g_settings.recurse && !noRecurse;
         g_job.outDir = cliOut;
+        g_job.coverDir = cliCover;
         for (auto& s : cliPaths) {
             Part p;
             SplitPathSpec(s, p.dir, p.pattern);
