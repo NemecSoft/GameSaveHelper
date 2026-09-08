@@ -8,6 +8,7 @@ src/GameSaveHelper.obj
 src/RCa*
 src/resource.res
 src/template.nsi
+src/app.ico
 
 # 编译产物 exe（build.bat 会重新生成）
 GameSaveHelper.exe
@@ -17,6 +18,8 @@ src/GameSaveHelper.exe
 build/
 out/
 logs/
+release/
+node_modules/
 
 # 测试数据
 _test/

@@ -1,0 +1,27 @@
+{
+  "name": "nsis",
+  "version": "1.0.0",
+  "description": "游戏存档备份助手：把游戏存档打包成一个双击即可恢复的 exe。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NemecSoft/GameSaveHelper.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/NemecSoft/GameSaveHelper/issues"
+  },
+  "homepage": "https://github.com/NemecSoft/GameSaveHelper#readme",
+  "dependencies": {
+    "@babel/parser": "^8.0.4"
+  }
+}

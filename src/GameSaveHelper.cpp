@@ -257,9 +257,76 @@ static bool ParseJsonString(const std::string& s, size_t& i, std::string& out)
     return false;
 }
 
+// 宽容版 JSON 字符串读取：容忍 Playday 导出数据里的坏转义。
+// 规则：\ 跳过下一个字符；遇到 " 时向后看，若跳过空白后是 , ] } 或另一个 " 之一
+// 则视为字符串结束，否则当作内容继续（用于容忍 "...*.*\" 这类坏转义）。
+// limit：可选扫描上界（如 savePaths 数组的 ']' 位置），超过视为未正常结束。
+static bool ParseJsonStringLenient(const std::string& s, size_t& i, std::string& out,
+                                   size_t limit = std::string::npos)
+{
+    if (i >= s.size() || s[i] != '"') return false;
+    i++;
+    out.clear();
+    while (i < s.size() && i < limit) {
+        char c = s[i];
+        if (c == '\\') {
+            if (i + 1 < s.size() && s[i + 1] == '"') {
+                // \" ：若后面是分隔符，说明这是坏转义的收尾——反斜杠属于值本身
+                size_t k = i + 2;
+                while (k < s.size() && (s[k]==' '||s[k]=='\t'||s[k]=='\r'||s[k]=='\n')) k++;
+                if (k >= s.size() || s[k] == ',' || s[k] == ']' || s[k] == '}') {
+                    out += '\\';
+                    i++;               // 停在结束引号上，由调用方越过
+                    return true;
+                }
+            }
+            i++;
+            if (i >= s.size()) return false;
+            char e = s[i++];
+            switch (e) {
+            case '"':  out += '"';  break;
+            case '\\': out += '\\'; break;
+            case '/':  out += '/';  break;
+            case 'n':  out += '\n'; break;
+            case 'r':  out += '\r'; break;
+            case 't':  out += '\t'; break;
+            case 'b':  out += '\b'; break;
+            case 'f':  out += '\f'; break;
+            default:   out += e;    break;   // \u 等：宽容处理，原样保留
+            }
+        } else if (c == '"') {
+            size_t k = i + 1;
+            while (k < s.size() && (s[k]==' '||s[k]=='\t'||s[k]=='\r'||s[k]=='\n')) k++;
+            if (k >= s.size() || s[k] == ',' || s[k] == ']' || s[k] == '}' || s[k] == '"') {
+                i++;
+                return true;
+            }
+            out += c; i++;               // 多余的引号（坏数据），当内容
+        } else {
+            out += c; i++;
+        }
+    }
+    return false;
+}
+
+// 清洗存档路径：去首尾空白、去末尾多余的反斜杠/引号（保留 X:\ 盘根）
+static std::wstring CleanSavePath(std::wstring p)
+{
+    size_t b = p.find_first_not_of(L" \t\r\n");
+    if (b == std::wstring::npos) return L"";
+    p = p.substr(b, p.find_last_not_of(L" \t\r\n") - b + 1);
+    while (p.size() > 3) {
+        wchar_t c = p.back();
+        if (c == L'\\' || c == L'/' || c == L'"') p.pop_back();
+        else break;
+    }
+    return p;
+}
+
 // 从 config.json 内容里找指定游戏的路径数组
-static bool ParseGameConfig(const std::string& json, const std::wstring& game,
-                            std::vector<std::wstring>& paths)
+// 返回：0=没找到该游戏，1=找到但数组为空，2=找到且有路径
+static int ParseGameConfig(const std::string& json, const std::wstring& game,
+                           std::vector<std::wstring>& paths)
 {
     std::string needle = "\"" + W2U8(game) + "\"";
     size_t k = json.find(needle);
@@ -270,35 +337,158 @@ static bool ParseGameConfig(const std::string& json, const std::wstring& game,
         if (e < json.size() && json[e] == ':') break;
         k = json.find(needle, k + 1);
     }
-    if (k == std::string::npos) return false;
+    if (k == std::string::npos) return 0;
 
     size_t lb = json.find('[', k);
     size_t rb = (lb == std::string::npos) ? std::string::npos : json.find(']', lb);
-    if (lb == std::string::npos || rb == std::string::npos) return false;
+    if (lb == std::string::npos || rb == std::string::npos) return 0;
 
     size_t i = lb + 1;
     while (i < rb) {
         if (json[i] == '"') {
             std::string val;
-            if (!ParseJsonString(json, i, val)) return false;
-            paths.push_back(U82W(val));
+            if (!ParseJsonStringLenient(json, i, val)) return 0;
+            paths.push_back(CleanSavePath(U82W(val)));
         } else {
             i++;
         }
     }
-    return !paths.empty();
+    return paths.empty() ? 1 : 2;
 }
 
-// 依次在 当前目录\config.json、exe目录\config.json 里找
-static bool LoadConfigPaths(const std::wstring& game,
-                            std::vector<std::wstring>& paths, std::wstring& usedFile)
+// 解析 Playday 导出的 games.json：顶层数组，每项形如
+//   { "name": "游戏名", ... , "savePaths": ["X:\\...\\*.*", ...] }
+// 该导出数据存在坏转义（如 "...*.*\" 把收尾引号转义掉），无法用标准 JSON
+// 解析，也不能靠引号状态做结构扫描。所以用「缩进锚点」定位：
+// 游戏级字段的缩进正好是 2 个 Tab（\n\t\t"name": "、\n\t\t"savePaths": ），
+// 嵌套对象（actions 等）缩进更深，不会误命中。
+// 返回：0=没找到该游戏，1=找到但 savePaths 为空，2=找到且有路径
+static int ParseGamesJson(const std::string& json, const std::wstring& game,
+                          std::vector<std::wstring>& paths)
 {
-    wchar_t cur[MAX_PATH] = { 0 };
-    GetCurrentDirectoryW(MAX_PATH, cur);
-    std::vector<std::wstring> cands = {
-        JoinPath(cur, L"config.json"),
-        JoinPath(GetExeDir(), L"config.json")
-    };
+    const std::string nameKey = "\n\t\t\"name\": \"";
+    const std::string spKey  = "\n\t\t\"savePaths\"";
+
+    size_t pos = 0;
+    while (true) {
+        size_t nk = json.find(nameKey, pos);
+        if (nk == std::string::npos) return 0;
+
+        // 宽容读取游戏名（值里可能有坏转义）
+        size_t vq = nk + nameKey.size() - 1;      // 指向值的开引号
+        std::string val;
+        size_t i2 = vq;
+        if (!ParseJsonStringLenient(json, i2, val)) { pos = nk + 1; continue; }
+        pos = i2;
+        if (U82W(val) != game) continue;
+
+        // 本对象的 savePaths 必须出现在下一个游戏级 name 锚之前
+        size_t limit = json.find(nameKey, i2);
+        if (limit == std::string::npos) limit = json.size();
+        size_t sk = json.find(spKey, i2);
+        if (sk == std::string::npos || sk > limit) return 1;   // 没有该字段 = 空
+
+        size_t lb = json.find('[', sk);
+        size_t rb = (lb == std::string::npos) ? std::string::npos : json.find(']', lb);
+        if (lb == std::string::npos || rb == std::string::npos) return 1;
+
+        size_t i = lb + 1;
+        while (i < rb) {
+            while (i < rb && (json[i]==' '||json[i]=='\t'||json[i]=='\r'||json[i]=='\n'||json[i]==',')) i++;
+            if (i >= rb || json[i] == ']') break;
+            if (json[i] != '"') { i++; continue; }
+            std::string v;
+            // 限制在数组 ']' 之内扫描；解析不出正常结尾就当作数组到此为止
+            if (!ParseJsonStringLenient(json, i, v, rb)) break;
+            paths.push_back(CleanSavePath(U82W(v)));
+        }
+        return paths.empty() ? 1 : 2;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 程序自带设置（exe 目录下的 settings.json，release 部署时一起带上）：
+//   gamesJson : games.json 配置文件路径（读取存档路径用，可配置位置）
+//   nsis      : makensis.exe 路径（相对路径则相对本程序目录）
+//   outDir    : 备份包默认输出目录（留空 = 桌面）
+//   recurse   : 是否递归扫描子目录（"true" / "false"）
+// ---------------------------------------------------------------------------
+struct AppSettings {
+    std::wstring gamesJson;
+    std::wstring nsis;
+    std::wstring outDir;
+    bool recurse = true;
+};
+static AppSettings g_settings;
+
+// 在 JSON 文本里读指定 key 的字符串值（找 "key" 后跟冒号）
+static std::wstring ReadSettingString(const std::string& json, const char* key)
+{
+    std::string needle = std::string("\"") + key + "\"";
+    size_t k = json.find(needle);
+    while (k != std::string::npos) {
+        size_t colon = json.find(':', k + needle.size());
+        if (colon == std::string::npos) return L"";
+        size_t e = colon + 1;
+        while (e < json.size() && (json[e]==' '||json[e]=='\t'||json[e]=='\r'||json[e]=='\n')) e++;
+        if (e < json.size() && json[e] == '"') {
+            std::string val;
+            size_t i = e;
+            ParseJsonStringLenient(json, i, val);
+            return U82W(val);
+        }
+        k = json.find(needle, k + 1);
+    }
+    return L"";
+}
+
+static void LoadAppSettings()
+{
+    std::wstring f = JoinPath(GetExeDir(), L"settings.json");
+    HANDLE h = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD sz = GetFileSize(h, nullptr);
+    std::string raw((size_t)sz, '\0');
+    DWORD rd = 0;
+    ReadFile(h, &raw[0], sz, &rd, nullptr);
+    CloseHandle(h);
+    if (raw.size() >= 3 && (BYTE)raw[0] == 0xEF && (BYTE)raw[1] == 0xBB && (BYTE)raw[2] == 0xBF)
+        raw.erase(0, 3);
+    g_settings.gamesJson = ReadSettingString(raw, "gamesJson");
+    g_settings.nsis      = ReadSettingString(raw, "nsis");
+    g_settings.outDir    = ReadSettingString(raw, "outDir");
+    std::wstring rec     = ReadSettingString(raw, "recurse");
+    if (!rec.empty()) g_settings.recurse = (rec == L"true" || rec == L"1");
+}
+
+// 依次在配置候选里找：
+//   1) /config: 明确指定的文件（优先，支持两种格式）
+//   2) 当前目录\games.json → exe目录\games.json
+//   3) 当前目录\config.json → exe目录\config.json
+//   4) 内置兜底：Playday 导出的 games.json
+// 格式按内容自动识别：'[' 开头 = games.json 数组格式，'{' 开头 = config.json 格式
+// 返回：0=所有候选里都没找到该游戏，1=找到但配置为空，2=找到且有路径
+static int LoadConfigPaths(const std::wstring& game,
+                           std::vector<std::wstring>& paths, std::wstring& usedFile,
+                           const std::wstring& explicitFile = L"")
+{
+    std::vector<std::wstring> cands;
+    if (!explicitFile.empty()) {
+        cands.push_back(explicitFile);
+    } else {
+        wchar_t cur[MAX_PATH] = { 0 };
+        GetCurrentDirectoryW(MAX_PATH, cur);
+        cands = {
+            JoinPath(cur, L"games.json"),
+            JoinPath(GetExeDir(), L"games.json"),
+            JoinPath(cur, L"config.json"),
+            JoinPath(GetExeDir(), L"config.json"),
+        };
+        // settings.json 里配置的 games.json 路径优先于内置兜底
+        if (!g_settings.gamesJson.empty()) cands.push_back(g_settings.gamesJson);
+        cands.push_back(L"D:\\AI\\Code\\Playnite\\Playday\\games.json");
+    }
     for (auto& c : cands) {
         HANDLE h = CreateFileW(c.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -310,9 +500,18 @@ static bool LoadConfigPaths(const std::wstring& game,
         CloseHandle(h);
         if (raw.size() >= 3 && (BYTE)raw[0] == 0xEF && (BYTE)raw[1] == 0xBB && (BYTE)raw[2] == 0xBF)
             raw.erase(0, 3);
-        if (ParseGameConfig(raw, game, paths)) { usedFile = c; return true; }
+        // 跳过前导空白，按第一个字符判断格式
+        size_t p = raw.find_first_not_of(" \t\r\n");
+        int r = 0;
+        if (p != std::string::npos && raw[p] == '[')
+            r = ParseGamesJson(raw, game, paths);
+        else
+            r = ParseGameConfig(raw, game, paths);
+        if (r == 2) { usedFile = c; return 2; }
+        if (r == 1) { usedFile = c; return 1; }   // 找到但为空：不再往下找
+        // 0 = 这个文件里没有该游戏，继续下一个候选
     }
-    return false;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,12 +598,19 @@ static void SplitPathSpec(const std::wstring& in, std::wstring& dir, std::wstrin
 static bool FindMakeNsis(std::wstring& out)
 {
     std::wstring exeDir = GetExeDir();
-    std::vector<std::wstring> cands = {
-        JoinPath(exeDir, L"nsis\\makensis.exe"),
-        JoinPath(exeDir, L"makensis.exe"),
-        L"C:\\Program Files (x86)\\NSIS\\makensis.exe",
-        L"C:\\Program Files\\NSIS\\makensis.exe"
-    };
+    std::vector<std::wstring> cands;
+    // settings.json 里配置的 nsis 路径最优先（相对路径则相对本程序目录）
+    if (!g_settings.nsis.empty()) {
+        std::wstring n = g_settings.nsis;
+        if (n.find(L':') == std::wstring::npos &&
+            n.find_first_of(L"\\/") != 0)
+            n = JoinPath(exeDir, n);
+        cands.push_back(n);
+    }
+    cands.push_back(JoinPath(exeDir, L"nsis\\makensis.exe"));
+    cands.push_back(JoinPath(exeDir, L"makensis.exe"));
+    cands.push_back(L"C:\\Program Files (x86)\\NSIS\\makensis.exe");
+    cands.push_back(L"C:\\Program Files\\NSIS\\makensis.exe");
     // 注册表里登记的 NSIS 安装路径
     HKEY hk = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NSIS", 0, KEY_READ | KEY_WOW64_32KEY, &hk) == ERROR_SUCCESS) {
@@ -483,9 +689,12 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     std::wstring log;
     auto logLine = [&log](const std::wstring& s) { log += s; log += L"\r\n"; };
 
-    // 1. 逐位置扫描 + 异常检查（目录不存在 / 无匹配文件）
+    // 1. 逐位置扫描：目录不存在 / 空目录的位置记为警告并跳过，
+    //    只要有一个位置有文件就继续；全部位置都没文件才中止
     std::vector<Part> parts = job.parts;
-    std::vector<std::wstring> errs;
+    std::vector<Part> used;                  // 实际有文件、参与打包的位置
+    std::vector<std::wstring> errs;          // 全部无效时的原因列表
+    std::vector<std::wstring> warns;         // 跳过的位置（出现在结果详情里）
     ULONGLONG totalSize = 0; int totalFiles = 0;
     int nPos = (int)parts.size();
     for (int i = 0; i < nPos; i++) {
@@ -494,19 +703,25 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
             progress(L"正在扫描位置 " + std::to_wstring(i + 1) + L"/" +
                      std::to_wstring(nPos) + L"：" + p.search);
         if (GetFileAttributesW(p.dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            warns.push_back(L"[位置" + std::to_wstring(i + 1) + L"] 目录不存在：" + p.search);
             errs.push_back(L"[位置" + std::to_wstring(i + 1) + L"] 目录不存在：" + p.search);
             continue;
         }
         EnumResult er;
         EnumFiles(p.dir, p.pattern, job.recurse, er);
         p.size = er.size; p.count = er.count;
-        totalSize += er.size; totalFiles += er.count;
         logLine(L"  " + p.search + L"  ->  " + std::to_wstring(er.count) + L" 个文件, " + FormatSize(er.size));
-        if (er.count == 0)
+        if (er.count == 0) {
+            warns.push_back(L"[位置" + std::to_wstring(i + 1) + L"] 没有匹配到任何文件（空目录）：" + p.search);
             errs.push_back(L"[位置" + std::to_wstring(i + 1) + L"] 没有匹配到任何文件：" + p.search);
+            continue;
+        }
+        used.push_back(p);
+        totalSize += er.size; totalFiles += er.count;
     }
 
-    if (!errs.empty()) {
+    parts = used;
+    if (parts.empty()) {
         std::wstring all;
         for (auto& e : errs) { all += e; all += L"\n"; }
         oc.header = L"备份失败，没有存档或者存档被锁定了";
@@ -527,7 +742,9 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     swprintf_s(human, L"%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay,
                st.wHour, st.wMinute, st.wSecond);
 
-    std::wstring outDir = job.outDir.empty() ? GetDesktopDir() : job.outDir;
+    std::wstring outDir = !job.outDir.empty() ? job.outDir
+                        : (!g_settings.outDir.empty() ? g_settings.outDir
+                                                      : GetDesktopDir());
     DWORD mkAttr = GetFileAttributesW(outDir.c_str());
     if (mkAttr == INVALID_FILE_ATTRIBUTES) CreateDirectoryW(outDir.c_str(), nullptr);
     std::wstring exePath = JoinPath(outDir,
@@ -552,23 +769,24 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
         return oc;
     }
 
-    std::string sVars, sInit, sCreate, sLeave, sOver, sRestore;
+    std::string sVars, sInit, sCreate, sLeave, sOver, sRestore, sRaise;
     int n = (int)parts.size();
     for (int i = 0; i < n; i++) {
         const Part& p = parts[i];
         char idx[16]; sprintf_s(idx, "%d", i);
         std::string I(idx);
-        int y = 70 + i * 15;
+        int y = 112 + i * 16;
         char ys[16]; sprintf_s(ys, "%d", y);
 
-        sVars    += "Var P" + I + "\r\nVar E" + I + "\r\n";
+        sVars    += "Var P" + I + "\r\nVar E" + I + "\r\nVar B" + I + "\r\n";
         sInit    += "  StrCpy $P" + I + " \"" + W2U8(NsisEsc(p.dir)) + "\"\r\n";
 
         sCreate  += "  ${NSD_CreateText} 4% " + std::string(ys) + "u 74% 13u \"$P" + I + "\"\r\n";
         sCreate  += "  Pop $E" + I + "\r\n";
+        sCreate  += "  SetCtlColors $E" + I + " ${CLR_TEXT} ${CLR_EDITBG}\r\n";
         sCreate  += "  ${NSD_CreateBrowseButton} 80% " + std::string(ys) + "u 20% 13u \"浏览\"\r\n";
-        sCreate  += "  Pop $0\r\n";
-        sCreate  += "  ${NSD_OnClick} $0 OnBrowse\r\n";
+        sCreate  += "  Pop $B" + I + "\r\n";
+        sCreate  += "  ${NSD_OnClick} $B" + I + " OnBrowse\r\n";
 
         sLeave   += "  ${NSD_GetText} $E" + I + " $P" + I + "\r\n";
 
@@ -588,9 +806,14 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
         sRestore += "    IntOp $OK $OK + 1\r\n";
         sRestore += "    StrCpy $REPORT \"$REPORT[完成] $P" + I + "$\\r$\\n\"\r\n";
         sRestore += "  ${EndIf}\r\n";
+        // 每个输入框/浏览按钮在铺底后要显式提回最上层（防止被整页底色盖住）
+        sRaise   += "  System::Call \"user32::BringWindowToTop(p $E" + I + ")\"\r\n";
+        sRaise   += "  System::Call \"user32::BringWindowToTop(p $B" + I + ")\"\r\n";
     }
 
-    int tipY = 70 + n * 15 + 2;
+    int tipY = 112 + n * 16 + 6;
+    char bandY[16]; sprintf_s(bandY, "%d", tipY + 24);
+    char btnY[16];  sprintf_s(btnY,  "%d", tipY + 30);
     char tipS[16]; sprintf_s(tipS, "%d", tipY);
 
     // 图标：优先 assets\icon.ico，其次 NSIS 自带（用 NSIS 原生 Icon 命令，
@@ -613,10 +836,13 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     ReplaceAll(tmpl, "@@PART_VARS@@",     sVars);
     ReplaceAll(tmpl, "@@PART_INIT@@",     sInit);
     ReplaceAll(tmpl, "@@PART_CREATE@@",   sCreate);
+    ReplaceAll(tmpl, "@@PART_RAISE@@",    sRaise);
     ReplaceAll(tmpl, "@@PART_LEAVE@@",    sLeave);
     ReplaceAll(tmpl, "@@PART_OVERWRITE@@",sOver);
     ReplaceAll(tmpl, "@@PART_RESTORE@@",  sRestore);
     ReplaceAll(tmpl, "@@TIP_Y@@",         tipS);
+    ReplaceAll(tmpl, "@@BAND_Y@@",        bandY);
+    ReplaceAll(tmpl, "@@BTN_Y@@",         btnY);
 
     std::wstring buildDir = JoinPath(GetExeDir(), L"build");
     CreateDirectoryW(buildDir.c_str(), nullptr);
@@ -699,6 +925,12 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     logLine(L"恢复路径（双击备份包可一键恢复到以下位置）：");
     for (const auto& p : parts)
         logLine(L"  · " + p.dir);
+    if (!warns.empty()) {
+        logLine(L"");
+        logLine(L"以下位置没有文件，已跳过：");
+        for (const auto& w : warns)
+            logLine(L"  · " + w);
+    }
     logLine(L"");
     logLine(L"使用方法：");
     logLine(L"  1. 把备份文件保存到网盘、U盘或微信/QQ，即可带走存档");
@@ -964,6 +1196,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
 
+    // 读取程序设置（exe 目录下的 settings.json；没有就用默认值）
+    LoadAppSettings();
+
     g_fontUI = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
@@ -987,6 +1222,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     bool quiet = false;
     bool noRecurse = false;
     std::wstring cliOut;
+    std::wstring cliConfig;
     std::wstring argError;
     std::wstring configFileUsed;
 
@@ -1032,6 +1268,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     if (opt == L"q" || opt == L"quiet")           { quiet = true; continue; }
                     if (opt == L"nr" || opt == L"norecurse")      { noRecurse = true; continue; }
                     if (opt.compare(0, 4, L"out:") == 0)          { cliOut = a.substr(5); continue; }
+                    if (opt.compare(0, 7, L"config:") == 0)       { cliConfig = a.substr(8); continue; }
                     argError = L"未知选项：" + a;
                     break;
                 }
@@ -1045,21 +1282,35 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         }
     }
 
-    // 只有游戏名 -> config.json 模式
+    // 只有游戏名 -> 从配置文件读取存档路径（games.json / config.json）
     if (argError.empty() && !cliName.empty() && cliPaths.empty()) {
-        if (!LoadConfigPaths(cliName, cliPaths, configFileUsed)) {
-            argError = L"在 config.json 里找不到游戏「" + cliName + L"」的存档路径配置。";
+        int cr = LoadConfigPaths(cliName, cliPaths, configFileUsed, cliConfig);
+        if (cr == 0) {
+            argError = L"在配置文件里找不到游戏「" + cliName + L"」的存档路径配置。"
+                       L"\n\n查找顺序：/config: 指定文件 → 当前目录\\games.json → 本程序目录\\games.json"
+                       L" → 当前目录\\config.json → 本程序目录\\config.json"
+                       L" → D:\\AI\\Code\\Playnite\\Playday\\games.json";
+        } else if (cr == 1) {
+            argError = L"游戏「" + cliName + L"」的存档配置为空，请联系管理员。";
         }
     }
 
     autoStart = argError.empty() && !cliName.empty() && !cliPaths.empty();
+
+    // 静默模式下参数错误：错误写 stderr 后直接退出（不弹窗口），返回码 2
+    if (quiet && !argError.empty()) {
+        SayError(argError);
+        LocalFree(argv);
+        CoUninitialize();
+        return 2;
+    }
 
     // 静默模式：不出窗口，直接干完就退出（方便脚本调用）；
     // 仅在参数完全合法时进入，参数错误仍会弹红底窗口提示
     if (quiet && autoStart) {
         Job job;
         job.gameName = cliName;
-        job.recurse = !noRecurse;
+        job.recurse = g_settings.recurse && !noRecurse;
         job.outDir = cliOut;      // 空 = 默认放系统桌面
         for (auto& s : cliPaths) {
             Part p;
@@ -1095,16 +1346,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         g_text = argError + L"\r\n\r\n";
         g_text += L"用法：\r\n";
         g_text += L"  GameSaveHelper.exe 游戏名\r\n";
-        g_text += L"      到 config.json 里读取该游戏的存档路径配置\r\n";
+        g_text += L"      从配置文件读取该游戏的存档路径（games.json 优先，可 /config: 指定）\r\n";
         g_text += L"  GameSaveHelper.exe 游戏名 \"D:\\存档目录\\*.*\" [\"更多路径\\*.*\"]\r\n";
         g_text += L"      用命令行指定的路径备份\r\n";
+        g_text += L"选项：\r\n";
+        g_text += L"  /config:文件路径   指定配置文件（games.json 或 config.json 格式）\r\n";
+        g_text += L"  /out:目录          指定备份输出目录（默认桌面）\r\n";
+        g_text += L"  /q                 静默模式（脚本调用，不出窗口）\r\n";
         g_text += L"示例：\r\n";
         g_text += L"  GameSaveHelper.exe 大富翁11 \"D:\\games\\Z\\Richman 11\\2074800\\*.*\"\r\n";
         SayError(argError);
     } else if (autoStart) {
         // 参数合法：组装任务，窗口打开后自动开始备份
         g_job.gameName = cliName;
-        g_job.recurse = !noRecurse;
+        g_job.recurse = g_settings.recurse && !noRecurse;
         g_job.outDir = cliOut;
         for (auto& s : cliPaths) {
             Part p;

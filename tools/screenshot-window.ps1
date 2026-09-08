@@ -1,5 +1,5 @@
 param([string]$Exe, [string]$OutPng, [string]$ArgList = "")
-# 启动指定 exe，等窗口出来后截屏窗口区域保存为 png，然后关掉进程
+# 启动指定 exe，等窗口出来后置顶并截屏窗口区域保存为 png，然后关掉进程
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 public class W {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   public struct RECT { public int L; public int T; public int R; public int B; }
 }
 "@
@@ -15,12 +16,17 @@ if ($ArgList -ne "") {
 } else {
     $p = Start-Process -FilePath $Exe -PassThru
 }
-Start-Sleep -Milliseconds 3000
+Start-Sleep -Milliseconds 3500
 $p.Refresh()
 $h = $p.MainWindowHandle
 if ($h -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id -Force; Write-Output "no window"; exit 1 }
-[W]::SetForegroundWindow($h) | Out-Null
-Start-Sleep -Milliseconds 600
+# 反复置顶，确保窗口在最前
+for ($i = 0; $i -lt 3; $i++) {
+    [W]::BringWindowToTop($h) | Out-Null
+    [W]::SetForegroundWindow($h) | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+Start-Sleep -Milliseconds 500
 $r = New-Object W+RECT
 [W]::GetWindowRect($h, [ref]$r) | Out-Null
 $wd = $r.R - $r.L; $ht = $r.B - $r.T
