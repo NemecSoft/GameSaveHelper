@@ -593,12 +593,13 @@ static Outcome RunJob(const Job& job, const ProgressFn& progress = {})
     int tipY = 70 + n * 15 + 2;
     char tipS[16]; sprintf_s(tipS, "%d", tipY);
 
-    // 图标
+    // 图标：优先 assets\icon.ico，其次 NSIS 自带（用 NSIS 原生 Icon 命令，
+    // 模板没引 MUI2，写 !define MUI_ICON 是不生效的）
     std::string iconLine = "; (无图标)";
     std::wstring icon1 = JoinPath(GetExeDir(), L"assets\\icon.ico");
     std::wstring icon2 = JoinPath(nsisHome, L"Contrib\\Graphics\\Icons\\modern-install.ico");
-    if (FileExistsW(icon1))      iconLine = "!define MUI_ICON \"" + W2U8(NsisEsc(icon1)) + "\"";
-    else if (FileExistsW(icon2)) iconLine = "!define MUI_ICON \"" + W2U8(NsisEsc(icon2)) + "\"";
+    if (FileExistsW(icon1))      iconLine = "Icon \"" + W2U8(NsisEsc(icon1)) + "\"";
+    else if (FileExistsW(icon2)) iconLine = "Icon \"" + W2U8(NsisEsc(icon2)) + "\"";
 
     ReplaceAll(tmpl, "@@BUILD_TIME@@",    W2U8(human));
     ReplaceAll(tmpl, "@@PRODUCT_NAME@@",  W2U8(NsisEsc(job.gameName)));

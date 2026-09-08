@@ -56,7 +56,10 @@ if not exist "%ROOT%template\GameSaveHelper.nsi" (
     exit /b 3
 )
 copy /y "%ROOT%template\GameSaveHelper.nsi" "%SRCDIR%\template.nsi" >nul
-if exist "%ROOT%nsis\Contrib\Graphics\Icons\modern-install.ico" (
+REM 主程序图标：优先用 assets\icon.ico（scripts\gen-app-icon.mjs 生成），否则退回 NSIS 自带图标
+if exist "%ROOT%assets\icon.ico" (
+    copy /y "%ROOT%assets\icon.ico" "%SRCDIR%\app.ico" >nul
+) else if exist "%ROOT%nsis\Contrib\Graphics\Icons\modern-install.ico" (
     copy /y "%ROOT%nsis\Contrib\Graphics\Icons\modern-install.ico" "%SRCDIR%\app.ico" >nul
 )
 
